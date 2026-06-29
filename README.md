@@ -47,3 +47,5 @@ npm run check
 ## 说明
 
 本工具用于个人决策辅助，税费与市场分析均为估算，不构成投资、法律或税务建议。
+
+Trigger Vercel deployment.
