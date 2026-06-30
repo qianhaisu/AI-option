@@ -31,6 +31,13 @@ const mimeTypes = {
   ".webp": "image/webp"
 };
 
+const marketPeriods = {
+  "1M": { range: "1mo", interval: "1d" },
+  "3M": { range: "3mo", interval: "1d" },
+  "6M": { range: "6mo", interval: "1d" },
+  "1Y": { range: "1y", interval: "1wk" }
+};
+
 function json(res, status, body) {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
@@ -204,6 +211,146 @@ function textToHtml(text) {
     .join("");
 }
 
+function formatMarketLabel(timestamp) {
+  return new Date(timestamp * 1000).toLocaleDateString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "short",
+    day: "numeric"
+  });
+}
+
+async function fetchYahooChart(symbol, period = "1M") {
+  const config = marketPeriods[period] || marketPeriods["1M"];
+  const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+  url.searchParams.set("range", config.range);
+  url.searchParams.set("interval", config.interval);
+  url.searchParams.set("includePrePost", "false");
+
+  const response = await fetch(url, {
+    headers: {
+      "accept": "application/json",
+      "user-agent": "Mozilla/5.0"
+    }
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`${symbol} 行情源请求失败（${response.status}）：${body.slice(0, 240)}`);
+  }
+
+  const body = await response.json();
+  const result = body.chart?.result?.[0];
+  const apiError = body.chart?.error;
+  if (!result || apiError) {
+    throw new Error(`${symbol} 行情源没有返回数据：${apiError?.description || "empty result"}`);
+  }
+
+  return result;
+}
+
+async function fetchQunheMarket(period = "1M") {
+  const aliases = ["00068.HK", "0068.HK"];
+  const errors = [];
+  let result = null;
+  let sourceSymbol = null;
+
+  for (const symbol of aliases) {
+    try {
+      result = await fetchYahooChart(symbol, period);
+      sourceSymbol = symbol;
+      break;
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+
+  if (!result) {
+    throw new Error(`实时行情获取失败：${errors.join("；")}`);
+  }
+
+  const timestamps = result.timestamp || [];
+  const closes = result.indicators?.quote?.[0]?.close || [];
+  const points = timestamps
+    .map((timestamp, index) => ({
+      timestamp,
+      label: formatMarketLabel(timestamp),
+      close: closes[index]
+    }))
+    .filter((point) => Number.isFinite(point.close));
+
+  if (!points.length) {
+    throw new Error("行情源返回的数据没有可用收盘价");
+  }
+
+  const meta = result.meta || {};
+  const price = Number.isFinite(meta.regularMarketPrice)
+    ? meta.regularMarketPrice
+    : points[points.length - 1].close;
+  const previousClose = Number.isFinite(meta.previousClose)
+    ? meta.previousClose
+    : Number.isFinite(meta.chartPreviousClose)
+      ? meta.chartPreviousClose
+      : points[Math.max(points.length - 2, 0)].close;
+  const change = price - previousClose;
+  const changePct = previousClose ? (change / previousClose) * 100 : 0;
+  const updatedAt = meta.regularMarketTime
+    ? new Date(meta.regularMarketTime * 1000).toISOString()
+    : new Date().toISOString();
+
+  return {
+    symbol: "00068.HK",
+    name: "群核科技",
+    currency: meta.currency || "HKD",
+    exchangeName: meta.exchangeName || "HKG",
+    sourceSymbol,
+    price,
+    previousClose,
+    change,
+    changePct,
+    updatedAt,
+    period,
+    labels: points.map((point) => point.label),
+    data: points.map((point) => Number(point.close.toFixed(3))),
+    source: `Yahoo Finance (${sourceSymbol})`
+  };
+}
+
+async function getMarketQuote(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const period = url.searchParams.get("period") || "1M";
+  const market = await fetchQunheMarket(period);
+  return json(res, 200, market);
+}
+
+async function fetchHkdCnyRate() {
+  const response = await fetch("https://api.frankfurter.app/latest?from=HKD&to=CNY", {
+    headers: {
+      "accept": "application/json",
+      "user-agent": "Mozilla/5.0"
+    }
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`汇率源请求失败（${response.status}）：${body.slice(0, 240)}`);
+  }
+  const body = await response.json();
+  const rate = body.rates?.CNY;
+  if (!Number.isFinite(rate)) {
+    throw new Error("汇率源没有返回 HKD/CNY 数据");
+  }
+  return {
+    base: "HKD",
+    quote: "CNY",
+    rate,
+    date: body.date,
+    updatedAt: new Date().toISOString(),
+    source: "Frankfurter"
+  };
+}
+
+async function getMarketRate(req, res) {
+  return json(res, 200, await fetchHkdCnyRate());
+}
+
 function quheContext(metrics = {}) {
   const price = Number(metrics.price) || 0;
   const rate = Number(metrics.rate) || 0;
@@ -242,15 +389,16 @@ async function analyzeQunhe(req, res) {
 async function chatQunhe(req, res) {
   const body = await readJson(req);
   const question = String(body.question || "").trim();
+  const clientTime = String(body.clientTime || "").trim();
   if (!question) return json(res, 400, { error: "问题不能为空" });
   const content = await callZhipuText(aiConfig.textModel, [
     {
       role: "system",
-      content: "你是群核期权助手。回答要结合用户当前参数，优先说明估算逻辑、风险和行动边界。不要声称知道实时行情或最新公告；如果问题需要外部事实，明确说需要用户补充或接入数据源。中文回答，控制在 180 字以内。"
+      content: "你是群核期权助手。请直接回答用户问题，并结合用户当前参数说明估算逻辑、风险和行动边界。不要声称知道实时行情或最新公告；如果问题需要外部事实，明确说需要用户补充或接入数据源。中文回答，控制在 180 字以内。"
     },
     {
       role: "user",
-      content: `当前参数：\n${quheContext(body.metrics)}\n\n用户问题：${question}`
+      content: `当前时间（Asia/Shanghai）：${clientTime || "未提供"}\n\n当前参数：\n${quheContext(body.metrics)}\n\n用户问题：${question}`
     }
   ]);
   return json(res, 200, { html: textToHtml(content), text: content });
@@ -292,6 +440,12 @@ async function handleRequest(req, res) {
     }
     if (req.method === "PUT" && url.pathname === "/api/settings/ai") {
       return await updateAiSettings(req, res);
+    }
+    if (req.method === "GET" && url.pathname === "/api/market/quote") {
+      return await getMarketQuote(req, res);
+    }
+    if (req.method === "GET" && url.pathname === "/api/market/rate") {
+      return await getMarketRate(req, res);
     }
     if (req.method === "POST" && url.pathname === "/api/quhe/analyze") {
       return await analyzeQunhe(req, res);
