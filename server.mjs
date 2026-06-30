@@ -32,6 +32,7 @@ const mimeTypes = {
 };
 
 const marketPeriods = {
+  "5D": { range: "5d", interval: "1d" },
   "1M": { range: "1mo", interval: "1d" },
   "3M": { range: "3mo", interval: "1d" },
   "6M": { range: "6mo", interval: "1d" },
@@ -247,44 +248,40 @@ async function fetchYahooChart(symbol, period = "1M") {
   return result;
 }
 
-async function fetchQunheMarket(period = "1M") {
-  const aliases = ["00068.HK", "0068.HK"];
-  const errors = [];
-  let result = null;
-  let sourceSymbol = null;
-
-  for (const symbol of aliases) {
-    try {
-      result = await fetchYahooChart(symbol, period);
-      sourceSymbol = symbol;
-      break;
-    } catch (error) {
-      errors.push(error.message);
-    }
-  }
-
-  if (!result) {
-    throw new Error(`实时行情获取失败：${errors.join("；")}`);
-  }
-
+function normalizeYahooMarket(result, sourceSymbol, period) {
   const timestamps = result.timestamp || [];
-  const closes = result.indicators?.quote?.[0]?.close || [];
+  const quote = result.indicators?.quote?.[0] || {};
+  const closes = quote.close || [];
+  const opens = quote.open || [];
+  const highs = quote.high || [];
+  const lows = quote.low || [];
+  const meta = result.meta || {};
   const points = timestamps
     .map((timestamp, index) => ({
       timestamp,
       label: formatMarketLabel(timestamp),
-      close: closes[index]
+      close: [closes[index], opens[index], highs[index], lows[index]].find((value) => Number.isFinite(value))
     }))
     .filter((point) => Number.isFinite(point.close));
 
-  if (!points.length) {
-    throw new Error("行情源返回的数据没有可用收盘价");
-  }
-
-  const meta = result.meta || {};
   const price = Number.isFinite(meta.regularMarketPrice)
     ? meta.regularMarketPrice
-    : points[points.length - 1].close;
+    : points.length
+      ? points[points.length - 1].close
+      : null;
+  if (!Number.isFinite(price)) {
+    throw new Error(`${sourceSymbol} 行情源返回的数据没有可用价格`);
+  }
+
+  if (!points.length) {
+    const timestamp = meta.regularMarketTime || Math.floor(Date.now() / 1000);
+    points.push({
+      timestamp,
+      label: formatMarketLabel(timestamp),
+      close: price
+    });
+  }
+
   const previousClose = Number.isFinite(meta.previousClose)
     ? meta.previousClose
     : Number.isFinite(meta.chartPreviousClose)
@@ -312,6 +309,26 @@ async function fetchQunheMarket(period = "1M") {
     data: points.map((point) => Number(point.close.toFixed(3))),
     source: `Yahoo Finance (${sourceSymbol})`
   };
+}
+
+async function fetchQunheMarket(period = "1M") {
+  const aliases = ["00068.HK", "0068.HK"];
+  const periods = [...new Set([period, "5D"])];
+  const errors = [];
+
+  for (const currentPeriod of periods) {
+    for (const symbol of aliases) {
+      try {
+        const result = await fetchYahooChart(symbol, currentPeriod);
+        const market = normalizeYahooMarket(result, symbol, currentPeriod);
+        return { ...market, requestedPeriod: period };
+      } catch (error) {
+        errors.push(`${currentPeriod}/${symbol}: ${error.message}`);
+      }
+    }
+  }
+
+  throw new Error(`实时行情获取失败：${errors.join("；")}`);
 }
 
 async function getMarketQuote(req, res) {
