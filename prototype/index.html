@@ -23,11 +23,13 @@
         <div class="stock-header">
           <div>
             <strong>群核科技</strong>
-            <span>港交所 · 当前使用模拟行情，可手动改价</span>
+            <span>港交所 · 实时行情来自线上行情源，可手动改价做情景测算</span>
+            <span class="market-updated">更新时间：<b id="market-updated-at">--</b></span>
           </div>
           <div class="stock-price-block">
-            <div class="stock-price" id="display-price">19.62</div>
-            <div class="stock-change down" id="display-change">▼ -0.38 (-1.90%)</div>
+            <div class="stock-price" id="display-price">11.50</div>
+            <div class="stock-change down" id="display-change">▼ -0.10 (-0.86%)</div>
+            <button type="button" class="market-refresh" id="refresh-market">刷新行情</button>
           </div>
         </div>
         <div class="chart-wrap">
@@ -49,7 +51,7 @@
               <label>
                 <span>当前股价</span>
                 <div class="input-row">
-                  <input type="number" id="price" value="19.62" step="0.01" min="0" />
+                  <input type="number" id="price" value="11.50" step="0.01" min="0" />
                   <b>HKD</b>
                   <button type="button" id="refresh-price">刷新</button>
                 </div>
